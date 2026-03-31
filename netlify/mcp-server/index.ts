@@ -2,13 +2,9 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   CallToolResult,
-  GetPromptResult,
-  ReadResourceResult,
 } from "@modelcontextprotocol/sdk/types.js";
 
-
 export const setupMCPServer = (): McpServer => {
-
   const server = new McpServer(
     {
       name: "stateless-server",
@@ -17,97 +13,105 @@ export const setupMCPServer = (): McpServer => {
     { capabilities: { logging: {} } }
   );
 
-  // Register a prompt template that allows the server to
-  // provide the context structure and (optionally) the variables
-  // that should be placed inside of the prompt for client to fill in.
-  server.prompt(
-    "greeting-template",
-    "A simple greeting prompt template",
-    {
-      name: z.string().describe("Name to include in greeting"),
-    },
-    async ({ name }): Promise<GetPromptResult> => {
-      return {
-        messages: [
-          {
-            role: "user",
-            content: {
-              type: "text",
-              text: `Please greet ${name} in a friendly manner.`,
-            },
-          },
-        ],
-      };
-    }
-  );
-
-  // Register a tool specifically for testing the ability
-  // to resume notification streams to the client
   server.tool(
-    "start-notification-stream",
-    "Starts sending periodic notifications for testing resumability",
+    "upload-html",
+    "Upload an HTML file to Netlify and return a public access link",
     {
-      interval: z
-        .number()
-        .describe("Interval in milliseconds between notifications")
-        .default(100),
-      count: z
-        .number()
-        .describe("Number of notifications to send (0 for 100)")
-        .default(10),
+      filename: z.string().describe("File name, e.g. index.html"),
+      html_content: z.string().describe("Complete HTML file content"),
     },
-    async (
-      { interval, count },
-      { sendNotification }
-    ): Promise<CallToolResult> => {
-      const sleep = (ms: number) =>
-        new Promise((resolve) => setTimeout(resolve, ms));
-      let counter = 0;
-
-      while (count === 0 || counter < count) {
-        counter++;
-        try {
-          await sendNotification({
-            method: "notifications/message",
-            params: {
-              level: "info",
-              data: `Periodic notification #${counter} at ${new Date().toISOString()}`,
-            },
-          });
-        } catch (error) {
-          console.error("Error sending notification:", error);
-        }
-        // Wait for the specified interval
-        await sleep(interval);
+    async ({ filename, html_content }): Promise<CallToolResult> => {
+      const token = process.env.NETLIFY_ACCESS_TOKEN;
+      if (!token) {
+        return {
+          content: [{ type: "text", text: "Error: NETLIFY_ACCESS_TOKEN not set" }],
+        };
       }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Started sending periodic notifications every ${interval}ms`,
+      try {
+        // Step 1: Create a new site
+        const siteRes = await fetch("https://api.netlify.com/api/v1/sites", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
           },
-        ],
-      };
+          body: JSON.stringify({ name: null }),
+        });
+
+        if (!siteRes.ok) {
+          const err = await siteRes.text();
+          return { content: [{ type: "text", text: `Failed to create site: ${err}` }] };
+        }
+
+        const site = await siteRes.json();
+        const siteId = site.id;
+
+        // Step 2: Calculate file digest (SHA1)
+        const encoder = new TextEncoder();
+        const data = encoder.encode(html_content);
+        const hashBuffer = await crypto.subtle.digest("SHA-1", data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const sha1 = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+
+        // Step 3: Create deploy with file manifest
+        const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            files: { [`/${filename}`]: sha1 },
+          }),
+        });
+
+        if (!deployRes.ok) {
+          const err = await deployRes.text();
+          return { content: [{ type: "text", text: `Failed to create deploy: ${err}` }] };
+        }
+
+        const deploy = await deployRes.json();
+        const deployId = deploy.id;
+
+        // Step 4: Upload the file
+        const uploadRes = await fetch(
+          `https://api.netlify.com/api/v1/deploys/${deployId}/files/${filename}`,
+          {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/octet-stream",
+            },
+            body: html_content,
+          }
+        );
+
+        if (!uploadRes.ok) {
+          const err = await uploadRes.text();
+          return { content: [{ type: "text", text: `Failed to upload file: ${err}` }] };
+        }
+
+        // Step 5: Return public URL
+        const siteUrl = site.ssl_url || site.url;
+        const fileUrl = filename === "index.html"
+          ? siteUrl
+          : `${siteUrl}/${filename}`;
+
+        return {
+          content: [{
+            type: "text",
+            text: `✅ Upload successful!\n\nPublic URL: ${fileUrl}\nSite ID: ${siteId}`,
+          }],
+        };
+
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error: ${String(error)}` }],
+        };
+      }
     }
   );
 
-  // Create a resource that can be fetched by the client through
-  // this MCP server.
-  server.resource(
-    "greeting-resource",
-    "https://example.com/greetings/default",
-    { mimeType: "text/plain" },
-    async (): Promise<ReadResourceResult> => {
-      return {
-        contents: [
-          {
-            uri: "https://example.com/greetings/default",
-            text: "Hello, world!",
-          },
-        ],
-      };
-    }
-  );
   return server;
 };
